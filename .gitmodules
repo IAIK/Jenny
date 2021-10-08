@@ -1,0 +1,12 @@
+[submodule "code/OurLib/lib/strace/strace"]
+	path = code/OurLib/lib/strace/strace
+	url = https://github.com/strace/strace.git
+[submodule "code/nginx"]
+	path = code/nginx
+	url = https://github.com/nginx/nginx.git
+[submodule "code/nginx_native"]
+	path = code/nginx_native
+	url = https://github.com/nginx/nginx.git
+[submodule "lmbench"]
+	path = code/lmbench
+	url = git@github.com:intel/lmbench.git

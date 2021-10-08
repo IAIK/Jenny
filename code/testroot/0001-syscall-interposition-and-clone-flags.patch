@@ -1,0 +1,377 @@
+From b422b04cbef29eb5f224321cb26f6cbe613613f2 Mon Sep 17 00:00:00 2001
+From: aAnonymous <anonymous@example.org>
+Date: Thu, 5 Aug 2021 12:58:28 +0200
+Subject: [PATCH] syscall interposition and clone flags
+
+---
+ misc/Makefile                             |   2 +-
+ nptl/pthread_attr_setscope.c              |   3 +-
+ sysdeps/unix/sysv/linux/Versions          |   1 +
+ sysdeps/unix/sysv/linux/createthread.c    |   4 +-
+ sysdeps/unix/sysv/linux/x86_64/syscall.S  |  40 +++++--
+ sysdeps/unix/sysv/linux/x86_64/syscalll.S |  67 ++++++++++++
+ sysdeps/unix/sysv/linux/x86_64/sysdep.h   | 125 +++++-----------------
+ 7 files changed, 137 insertions(+), 105 deletions(-)
+ create mode 100644 sysdeps/unix/sysv/linux/x86_64/syscalll.S
+
+diff --git a/misc/Makefile b/misc/Makefile
+index e167e199eb..28cac9e1bd 100644
+--- a/misc/Makefile
++++ b/misc/Makefile
+@@ -61,7 +61,7 @@ routines := brk sbrk sstk ioctl \
+ 	    truncate ftruncate truncate64 ftruncate64 \
+ 	    chflags fchflags \
+ 	    insremque getttyent getusershell getpass ttyslot \
+-	    syslog syscall daemon \
++	    syslog syscall syscalll daemon \
+ 	    mmap mmap64 munmap mprotect msync madvise mincore remap_file_pages\
+ 	    mlock munlock mlockall munlockall \
+ 	    efgcvt efgcvt_r qefgcvt qefgcvt_r \
+diff --git a/nptl/pthread_attr_setscope.c b/nptl/pthread_attr_setscope.c
+index ff2d2ca17b..54a922abd8 100644
+--- a/nptl/pthread_attr_setscope.c
++++ b/nptl/pthread_attr_setscope.c
+@@ -35,7 +35,8 @@ __pthread_attr_setscope (pthread_attr_t *attr, int scope)
+       break;
+ 
+     case PTHREAD_SCOPE_PROCESS:
+-      return ENOTSUP;
++      iattr->flags |= ATTR_FLAG_SCOPEPROCESS;
++      break;
+ 
+     default:
+       return EINVAL;
+diff --git a/sysdeps/unix/sysv/linux/Versions b/sysdeps/unix/sysv/linux/Versions
+index d385085c61..777ead54ce 100644
+--- a/sysdeps/unix/sysv/linux/Versions
++++ b/sysdeps/unix/sysv/linux/Versions
+@@ -187,5 +187,6 @@ libc {
+     __sigtimedwait;
+     # functions used by nscd
+     __netlink_assert_response;
++    syscalll;
+   }
+ }
+diff --git a/sysdeps/unix/sysv/linux/createthread.c b/sysdeps/unix/sysv/linux/createthread.c
+index 33e5f5dbbb..0de79ad981 100644
+--- a/sysdeps/unix/sysv/linux/createthread.c
++++ b/sysdeps/unix/sysv/linux/createthread.c
+@@ -90,8 +90,10 @@ create_thread (struct pthread *pd, const struct pthread_attr *attr,
+ 
+      The termination signal is chosen to be zero which means no signal
+      is sent.  */
++  const int thread_flag = attr->flags & ATTR_FLAG_SCOPEPROCESS ? SIGCHLD : CLONE_THREAD | CLONE_SIGHAND;
++
+   const int clone_flags = (CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SYSVSEM
+-			   | CLONE_SIGHAND | CLONE_THREAD
++			   | thread_flag
+ 			   | CLONE_SETTLS | CLONE_PARENT_SETTID
+ 			   | CLONE_CHILD_CLEARTID
+ 			   | 0);
+diff --git a/sysdeps/unix/sysv/linux/x86_64/syscall.S b/sysdeps/unix/sysv/linux/x86_64/syscall.S
+index 6c93fc6304..ad5348a5bb 100644
+--- a/sysdeps/unix/sysv/linux/x86_64/syscall.S
++++ b/sysdeps/unix/sysv/linux/x86_64/syscall.S
+@@ -27,14 +27,42 @@
+ 
+ 	.text
+ ENTRY (syscall)
+-	movq %rdi, %rax		/* Syscall number -> rax.  */
+-	movq %rsi, %rdi		/* shift arg1 - arg5.  */
+-	movq %rdx, %rsi
+-	movq %rcx, %rdx
+-	movq %r8, %r10
+-	movq %r9, %r8
++	/* rdpkru uses rax, rcx, rdx, so free them */
++	movq %rdi, %r11		/* Syscall number --> tmp. */
++	movq %rsi, %rdi		/* arg1 */
++	movq %rdx, %rsi		/* arg2 */
++	movq %rcx, %r10		/* arg3 --> tmp. */
++	xor %ecx, %ecx
++	rdpkru			/* rax = pkru */
++	/* prepare syscall registers */
++	xchg %r11, %rax		/* rax = syscall number. r11 = pkru */
++	movq %r10, %rdx		/* arg3 */
++	movq %r8, %r10		/* arg4 */
++	movq %r9, %r8		/* arg5 */
++
++	andq $0x20, %r11	/* see SYSFILTER_DELEGATE_MASK in sysfilter.h */
+ 	movq 8(%rsp),%r9	/* arg6 is on the stack.  */
++	test %r11, %r11		/* if SYSFILTER_DELEGATE_MASK is zero, we're in monitor */
++	jz fallbacksys
++	movq %fs:0x280, %r11
++	test %r11, %r11
++	jz fallbacksys
++	lea continue(%rip), %rcx
++	jmp *%r11
++	jmp . /* should never reach here */
++
++//fallback:
++//	movq %rdi, %rax		/* Syscall number -> rax.  */
++//	movq %rsi, %rdi		/* shift arg1 - arg5.  */
++//	movq %rdx, %rsi
++//	movq %rcx, %rdx
++//	movq %r8, %r10
++//	movq %r9, %r8
++//	movq 8(%rsp),%r9	/* arg6 is on the stack.  */
++fallbacksys:
+ 	syscall			/* Do the system call.  */
++
++continue:
+ 	cmpq $-4095, %rax	/* Check %rax for error.  */
+ 	jae SYSCALL_ERROR_LABEL	/* Jump to error handler if error.  */
+ 	ret			/* Return to caller.  */
+diff --git a/sysdeps/unix/sysv/linux/x86_64/syscalll.S b/sysdeps/unix/sysv/linux/x86_64/syscalll.S
+new file mode 100644
+index 0000000000..f4873a6981
+--- /dev/null
++++ b/sysdeps/unix/sysv/linux/x86_64/syscalll.S
+@@ -0,0 +1,67 @@
++/* Copyright (C) 2001-2020 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#include <sysdep.h>
++
++/* Please consult the file sysdeps/unix/sysv/linux/x86-64/sysdep.h for
++   more information about the value -4095 used below.  */
++
++/* Usage: long syscall (syscall_number, arg1, arg2, arg3, arg4, arg5, arg6)
++   We need to do some arg shifting, the syscall_number will be in
++   rax.  */
++
++	.text
++ENTRY (syscalll)
++	/* rdpkru uses rax, rcx, rdx, so free them */
++	movq %rdi, %r11		/* Syscall number --> tmp. */
++	movq %rsi, %rdi		/* arg1 */
++	movq %rdx, %rsi		/* arg2 */
++	movq %rcx, %r10		/* arg3 --> tmp. */
++	xor %ecx, %ecx
++	rdpkru			/* rax = pkru */
++	/* prepare syscall registers */
++	xchg %r11, %rax		/* rax = syscall number. r11 = pkru */
++	movq %r10, %rdx		/* arg3 */
++	movq %r8, %r10		/* arg4 */
++	movq %r9, %r8		/* arg5 */
++
++	andq $0x20, %r11	/* see SYSFILTER_DELEGATE_MASK in sysfilter.h */
++	movq 8(%rsp),%r9	/* arg6 is on the stfallbackack.  */
++	test %r11, %r11		/* if SYSFILTER_DELEGATE_MASK is zero, we're in monitor */
++	jz fallbacksys
++	movq %fs:0x280, %r11
++	test %r11, %r11
++	jz fallbacksys
++	lea sysend(%rip), %rcx
++	jmp *%r11
++	jmp . /* should never reach here */
++sysend:
++	ret
++
++//fallback:
++//	movq %rdi, %rax		/* Syscall number -> rax.  */
++//	movq %rsi, %rdi		/* shift arg1 - arg5.  */
++//	movq %rdx, %rsi
++//	movq %rcx, %rdx
++//	movq %r8, %r10
++//	movq %r9, %r8
++//	movq 8(%rsp),%r9	/* arg6 is on the stack.  */
++fallbacksys:
++	syscall			/* Do the system call.  */
++	ret
++
++PSEUDO_END (syscalll)
+diff --git a/sysdeps/unix/sysv/linux/x86_64/sysdep.h b/sysdeps/unix/sysv/linux/x86_64/sysdep.h
+index c7f740a1df..23d0d94070 100644
+--- a/sysdeps/unix/sysv/linux/x86_64/sysdep.h
++++ b/sysdeps/unix/sysv/linux/x86_64/sysdep.h
+@@ -197,11 +197,27 @@
+ 
+ # undef	DO_CALL
+ # define DO_CALL(syscall_name, args, ulong_arg_1, ulong_arg_2) \
+-    DOARGS_##args				\
+     ZERO_EXTEND_##ulong_arg_1			\
+     ZERO_EXTEND_##ulong_arg_2			\
+-    movl $SYS_ify (syscall_name), %eax;		\
+-    syscall;
++    DOARGS_##args				\
++    mov %rdx, %r11;    /* save rdx */           \
++    xor %rcx, %rcx;    /* rcx is free to use */ \
++    rdpkru;            /* rax = pkru */         \
++    mov %r11, %rdx;    /* restore rdx */        \
++    andq $0x20, %rax;  /* see SYSFILTER_DELEGATE_MASK in sysfilter.h */ \
++    test %rax, %rax;                            \
++    jz fallback;                                \
++    movq %fs:0x280, %r11;                       \
++    test %r11, %r11;                            \
++    jz fallback;                                \
++    movl $SYS_ify (syscall_name), %eax;         \
++    lea end(%rip), %rcx;                        \
++    jmp *%r11;                                  \
++    jmp .; /* should never reach here */        \
++  fallback:                                     \
++    movl $SYS_ify (syscall_name), %eax;         \
++    syscall;                                    \
++  end:
+ 
+ # define DOARGS_0 /* nothing */
+ # define DOARGS_1 /* nothing */
+@@ -271,132 +287,49 @@
+ #define INTERNAL_SYSCALL_NCS(number, err, nr, args...)			\
+ 	internal_syscall##nr (number, err, args)
+ 
++
++long syscalll(long number, ...);
++
+ #undef internal_syscall0
+ #define internal_syscall0(number, err, dummy...)			\
+ ({									\
+-    unsigned long int resultvar;					\
+-    asm volatile (							\
+-    "syscall\n\t"							\
+-    : "=a" (resultvar)							\
+-    : "0" (number)							\
+-    : "memory", REGISTERS_CLOBBERED_BY_SYSCALL);			\
+-    (long int) resultvar;						\
++    syscalll(number, 0, 0, 0, 0, 0, 0); \
+ })
+ 
+ #undef internal_syscall1
+ #define internal_syscall1(number, err, arg1)				\
+ ({									\
+-    unsigned long int resultvar;					\
+-    TYPEFY (arg1, __arg1) = ARGIFY (arg1);			 	\
+-    register TYPEFY (arg1, _a1) asm ("rdi") = __arg1;			\
+-    asm volatile (							\
+-    "syscall\n\t"							\
+-    : "=a" (resultvar)							\
+-    : "0" (number), "r" (_a1)						\
+-    : "memory", REGISTERS_CLOBBERED_BY_SYSCALL);			\
+-    (long int) resultvar;						\
++    syscalll(number, (uint64_t)(arg1), 0, 0, 0, 0, 0); \
+ })
+ 
+ #undef internal_syscall2
+ #define internal_syscall2(number, err, arg1, arg2)			\
+ ({									\
+-    unsigned long int resultvar;					\
+-    TYPEFY (arg2, __arg2) = ARGIFY (arg2);			 	\
+-    TYPEFY (arg1, __arg1) = ARGIFY (arg1);			 	\
+-    register TYPEFY (arg2, _a2) asm ("rsi") = __arg2;			\
+-    register TYPEFY (arg1, _a1) asm ("rdi") = __arg1;			\
+-    asm volatile (							\
+-    "syscall\n\t"							\
+-    : "=a" (resultvar)							\
+-    : "0" (number), "r" (_a1), "r" (_a2)				\
+-    : "memory", REGISTERS_CLOBBERED_BY_SYSCALL);			\
+-    (long int) resultvar;						\
++    syscalll(number, (uint64_t)(arg1), (uint64_t)(arg2), 0, 0, 0, 0); \
+ })
+ 
+ #undef internal_syscall3
+ #define internal_syscall3(number, err, arg1, arg2, arg3)		\
+ ({									\
+-    unsigned long int resultvar;					\
+-    TYPEFY (arg3, __arg3) = ARGIFY (arg3);			 	\
+-    TYPEFY (arg2, __arg2) = ARGIFY (arg2);			 	\
+-    TYPEFY (arg1, __arg1) = ARGIFY (arg1);			 	\
+-    register TYPEFY (arg3, _a3) asm ("rdx") = __arg3;			\
+-    register TYPEFY (arg2, _a2) asm ("rsi") = __arg2;			\
+-    register TYPEFY (arg1, _a1) asm ("rdi") = __arg1;			\
+-    asm volatile (							\
+-    "syscall\n\t"							\
+-    : "=a" (resultvar)							\
+-    : "0" (number), "r" (_a1), "r" (_a2), "r" (_a3)			\
+-    : "memory", REGISTERS_CLOBBERED_BY_SYSCALL);			\
+-    (long int) resultvar;						\
++    syscalll(number, (uint64_t)(arg1), (uint64_t)(arg2), (uint64_t)(arg3), 0, 0, 0); \
+ })
+ 
+ #undef internal_syscall4
+ #define internal_syscall4(number, err, arg1, arg2, arg3, arg4)		\
+ ({									\
+-    unsigned long int resultvar;					\
+-    TYPEFY (arg4, __arg4) = ARGIFY (arg4);			 	\
+-    TYPEFY (arg3, __arg3) = ARGIFY (arg3);			 	\
+-    TYPEFY (arg2, __arg2) = ARGIFY (arg2);			 	\
+-    TYPEFY (arg1, __arg1) = ARGIFY (arg1);			 	\
+-    register TYPEFY (arg4, _a4) asm ("r10") = __arg4;			\
+-    register TYPEFY (arg3, _a3) asm ("rdx") = __arg3;			\
+-    register TYPEFY (arg2, _a2) asm ("rsi") = __arg2;			\
+-    register TYPEFY (arg1, _a1) asm ("rdi") = __arg1;			\
+-    asm volatile (							\
+-    "syscall\n\t"							\
+-    : "=a" (resultvar)							\
+-    : "0" (number), "r" (_a1), "r" (_a2), "r" (_a3), "r" (_a4)		\
+-    : "memory", REGISTERS_CLOBBERED_BY_SYSCALL);			\
+-    (long int) resultvar;						\
++    syscalll(number, (uint64_t)(arg1), (uint64_t)(arg2), (uint64_t)(arg3), (uint64_t)(arg4), 0, 0); \
+ })
+ 
+ #undef internal_syscall5
+ #define internal_syscall5(number, err, arg1, arg2, arg3, arg4, arg5)	\
+ ({									\
+-    unsigned long int resultvar;					\
+-    TYPEFY (arg5, __arg5) = ARGIFY (arg5);			 	\
+-    TYPEFY (arg4, __arg4) = ARGIFY (arg4);			 	\
+-    TYPEFY (arg3, __arg3) = ARGIFY (arg3);			 	\
+-    TYPEFY (arg2, __arg2) = ARGIFY (arg2);			 	\
+-    TYPEFY (arg1, __arg1) = ARGIFY (arg1);			 	\
+-    register TYPEFY (arg5, _a5) asm ("r8") = __arg5;			\
+-    register TYPEFY (arg4, _a4) asm ("r10") = __arg4;			\
+-    register TYPEFY (arg3, _a3) asm ("rdx") = __arg3;			\
+-    register TYPEFY (arg2, _a2) asm ("rsi") = __arg2;			\
+-    register TYPEFY (arg1, _a1) asm ("rdi") = __arg1;			\
+-    asm volatile (							\
+-    "syscall\n\t"							\
+-    : "=a" (resultvar)							\
+-    : "0" (number), "r" (_a1), "r" (_a2), "r" (_a3), "r" (_a4),		\
+-      "r" (_a5)								\
+-    : "memory", REGISTERS_CLOBBERED_BY_SYSCALL);			\
+-    (long int) resultvar;						\
++    syscalll(number, (uint64_t)(arg1), (uint64_t)(arg2), (uint64_t)(arg3), (uint64_t)(arg4), (uint64_t)(arg5), 0); \
+ })
+ 
+ #undef internal_syscall6
+ #define internal_syscall6(number, err, arg1, arg2, arg3, arg4, arg5, arg6) \
+ ({									\
+-    unsigned long int resultvar;					\
+-    TYPEFY (arg6, __arg6) = ARGIFY (arg6);			 	\
+-    TYPEFY (arg5, __arg5) = ARGIFY (arg5);			 	\
+-    TYPEFY (arg4, __arg4) = ARGIFY (arg4);			 	\
+-    TYPEFY (arg3, __arg3) = ARGIFY (arg3);			 	\
+-    TYPEFY (arg2, __arg2) = ARGIFY (arg2);			 	\
+-    TYPEFY (arg1, __arg1) = ARGIFY (arg1);			 	\
+-    register TYPEFY (arg6, _a6) asm ("r9") = __arg6;			\
+-    register TYPEFY (arg5, _a5) asm ("r8") = __arg5;			\
+-    register TYPEFY (arg4, _a4) asm ("r10") = __arg4;			\
+-    register TYPEFY (arg3, _a3) asm ("rdx") = __arg3;			\
+-    register TYPEFY (arg2, _a2) asm ("rsi") = __arg2;			\
+-    register TYPEFY (arg1, _a1) asm ("rdi") = __arg1;			\
+-    asm volatile (							\
+-    "syscall\n\t"							\
+-    : "=a" (resultvar)							\
+-    : "0" (number), "r" (_a1), "r" (_a2), "r" (_a3), "r" (_a4),		\
+-      "r" (_a5), "r" (_a6)						\
+-    : "memory", REGISTERS_CLOBBERED_BY_SYSCALL);			\
+-    (long int) resultvar;						\
++    syscalll(number, (uint64_t)(arg1), (uint64_t)(arg2), (uint64_t)(arg3), (uint64_t)(arg4), (uint64_t)(arg5), (uint64_t)(arg6)); \
+ })
+ 
+ # undef INTERNAL_SYSCALL_ERROR_P
+-- 
+2.25.1
+

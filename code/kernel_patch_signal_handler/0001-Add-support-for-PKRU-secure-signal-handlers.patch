@@ -1,0 +1,129 @@
+From c4bf90e6a4c6df79d61667239e1be2d4a8da57b5 Mon Sep 17 00:00:00 2001
+From: Samuel Weiser <samuel.weiser@iaik.tugraz.at>
+Date: Tue, 20 Jul 2021 00:42:07 +0200
+Subject: [PATCH] Add support for PKRU-secure signal handlers
+
+---
+ arch/x86/include/uapi/asm/signal.h |  8 ++++++
+ arch/x86/kernel/signal.c           | 42 ++++++++++++++++++++++++++++++
+ include/uapi/linux/signal.h        |  4 +++
+ kernel/signal.c                    |  2 +-
+ 4 files changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/include/uapi/asm/signal.h b/arch/x86/include/uapi/asm/signal.h
+index e5745d593dc7..1ba178685b8d 100644
+--- a/arch/x86/include/uapi/asm/signal.h
++++ b/arch/x86/include/uapi/asm/signal.h
+@@ -131,6 +131,14 @@ typedef struct sigaltstack {
+ 	size_t ss_size;
+ } stack_t;
+ 
++/* SS_FLAG values for sigaltstack */
++#define SS_PKEY_PREV_SHIFT	16
++#define SS_PKEY_PREV_AD	(PKRU_AD_BIT << SS_PKEY_PREV_SHIFT)
++#define SS_PKEY_PREV_WD	(PKRU_WD_BIT << SS_PKEY_PREV_SHIFT)
++
++#define SS_PKEY_SHIFT	20
++#define SS_PKEY_MASK	(0x0f << SS_PKEY_SHIFT)
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* _UAPI_ASM_X86_SIGNAL_H */
+diff --git a/arch/x86/kernel/signal.c b/arch/x86/kernel/signal.c
+index 8eb7193e158d..f5f8bdf8be8c 100644
+--- a/arch/x86/kernel/signal.c
++++ b/arch/x86/kernel/signal.c
+@@ -660,6 +660,23 @@ SYSCALL_DEFINE0(rt_sigreturn)
+ 	if (restore_altstack(&frame->uc.uc_stack))
+ 		goto badframe;
+ 
++	if (current->sas_ss_flags & SS_PKEY_MASK) {
++		/*
++		 * Restore original pkru, which will typically remove access to the
++		 * pkey of sigaltstack.
++		 */
++		u16 pkey = (current->sas_ss_flags & SS_PKEY_MASK) >> SS_PKEY_SHIFT;
++		u8 perm = (current->sas_ss_flags & (SS_PKEY_PREV_AD | SS_PKEY_PREV_WD)) >> SS_PKEY_PREV_SHIFT;
++		int pkru_pkey_bits = pkey * PKRU_BITS_PER_PKEY;
++		u32 pkru_mask = perm << pkru_pkey_bits;
++		u32 pkru = read_pkru();
++		u32 new_pkru = pkru | pkru_mask;
++		write_pkru(new_pkru);
++
++		printk(KERN_DEBUG "rt_sigreturn: restoring pkey: %d, ad/wd: %d\n", pkey, perm);
++		printk(KERN_DEBUG "rt_sigreturn: pkru: %08x-->%08x\n", pkru, new_pkru);
++	}
++
+ 	return regs->ax;
+ 
+ badframe:
+@@ -712,6 +729,26 @@ handle_signal(struct ksignal *ksig, struct pt_regs *regs)
+ {
+ 	bool stepping, failed;
+ 	struct fpu *fpu = &current->thread.fpu;
++	u32 new_pkru = init_pkru_value;
++
++	if (current->sas_ss_flags & SS_PKEY_MASK) {
++		/* Load pkey for alternative signal stack such that we can access it. */
++		u16 pkey = (current->sas_ss_flags & SS_PKEY_MASK) >> SS_PKEY_SHIFT;
++		int pkru_pkey_bits = pkey * PKRU_BITS_PER_PKEY;
++		u32 pkru_mask = (PKRU_AD_BIT | PKRU_WD_BIT) << pkru_pkey_bits;
++		u32 pkru = read_pkru();
++		u8 perm = (pkru >> pkru_pkey_bits) & (PKRU_AD_BIT | PKRU_WD_BIT);
++
++		new_pkru = pkru & ~pkru_mask;
++		write_pkru(new_pkru);
++
++		/* Store previous pkey permissions for rt_sigreturn */
++		current->sas_ss_flags &= ~((PKRU_AD_BIT | PKRU_WD_BIT) << SS_PKEY_PREV_SHIFT);
++		current->sas_ss_flags |= perm << SS_PKEY_PREV_SHIFT;
++
++		printk(KERN_DEBUG "handle_signal: allowing pkey: %d\n", pkey);
++		printk(KERN_DEBUG "handle_signal: pkru: %08x-->%08x\n", pkru, new_pkru);
++	}
+ 
+ 	if (v8086_mode(regs))
+ 		save_v86_state((struct kernel_vm86_regs *) regs, VM86_SIGNAL);
+@@ -764,6 +801,11 @@ handle_signal(struct ksignal *ksig, struct pt_regs *regs)
+ 		 * Ensure the signal handler starts with the new fpu state.
+ 		 */
+ 		fpu__clear(fpu);
++		/*
++		 * Load pkru for alternative signal stack again because
++		 * fpu__clear overwrites it with init_pkru_value
++		 * */
++		write_pkru(new_pkru);
+ 	}
+ 	signal_setup_done(failed, ksig, stepping);
+ }
+diff --git a/include/uapi/linux/signal.h b/include/uapi/linux/signal.h
+index e03238f8d478..9f278ba4ada4 100644
+--- a/include/uapi/linux/signal.h
++++ b/include/uapi/linux/signal.h
+@@ -8,6 +8,10 @@
+ #define SS_ONSTACK	1
+ #define SS_DISABLE	2
+ 
++/* 8 bits are reserved for arch */
++#define SS_ARCH_SHIFT	16
++#define SS_ARCH_MASK	(0xff << SS_ARCH_SHIFT)
++
+ /* bit-flags */
+ #define SS_AUTODISARM	(1U << 31)	/* disable sas during sighandling */
+ /* mask for all SS_xxx flags */
+diff --git a/kernel/signal.c b/kernel/signal.c
+index 595a36ab87d0..977c160e1e08 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -4023,7 +4023,7 @@ do_sigaltstack (const stack_t *ss, stack_t *oss, unsigned long sp,
+ 		if (unlikely(on_sig_stack(sp)))
+ 			return -EPERM;
+ 
+-		ss_mode = ss_flags & ~SS_FLAG_BITS;
++		ss_mode = ss_flags & ~SS_FLAG_BITS & ~SS_ARCH_MASK;
+ 		if (unlikely(ss_mode != SS_DISABLE && ss_mode != SS_ONSTACK &&
+ 				ss_mode != 0))
+ 			return -EINVAL;
+-- 
+2.25.1
+

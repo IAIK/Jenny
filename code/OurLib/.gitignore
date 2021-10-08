@@ -1,0 +1,16 @@
+/arch
+*.o
+*.so
+*.elf
+*.elf-shared
+*.a
+.gdb*
+.tty*
+core
+vgcore.*
+localstorage
+*.orig
+__pycache__
+results
+test7_binscan.txt
+*peda-session*
